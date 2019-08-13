@@ -47,7 +47,7 @@
         }, {once: true});
         // As arguments, you can pass non-default path to pocketsphinx.js and pocketsphinx.wasm:
         // recognizer.postMessage({'pocketsphinx.wasm': '/path/to/pocketsphinx.wasm', 'pocketsphinx.js': '/path/to/pocketsphinx.js'});
-        recognizer.postMessage({});
+        recognizer.postMessage({'pocketsphinx.wasm': 'pocketsphinx.wasm', 'pocketsphinx.js': 'pocketsphinx.js'});
         return deferred.promise();
       };
 
