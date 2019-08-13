@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>STT Test</title>
+  </head>
+  <body>
+    <select id="grammars"></select>
+    <button id="startBtn" disabled="disabled">Start</button>
+    <button id="stopBtn" disabled="disabled">Stop</button>
+    <button id="hold" disabled="disabled">Hold to talk</button>
+    <span id="recording-indicator" style="border-radius: 10px; -moz-border-radius: 10px; -webkit-border-radius: 10px; width: 20px; height: 20px; background: red;"></span>
+    <h2>Recognition Output</h2>
+    <div id="output" style="max-height:150px;overflow:auto;" >
+    </div>
+    <h2>Status</h2>
+    <div id="current-status">Loading page</div>
+
+    <script src="jquery-3.4.1.min.js"></script>
+    <script>
+      //"Aleph", "AA L EH F"
+
+      // These will be initialized later
+      var recognizer, recorder, callbackManager, audioContext;
+
+      // A convenience function to post a message to the recognizer and associate
+      // a callback to its response
+      function postRecognizerJob ( message ) {
+        return function () {
+          var deferred = $.Deferred();
+          console.log( message );
+          var msg = message || {};
+          if (callbackManager) msg.callbackId = callbackManager.add(deferred.resolve);
+          if (recognizer) recognizer.postMessage(msg);
+          return deferred.promise();
+        }
+      };
+
+      // This function initializes an instance of the recorder
+      // it posts a message right away and calls onReady when it
+      // is ready so that onmessage can be properly set
+      function spawnWorker(workerURL, onReady) {
+        var deferred = $.Deferred();
+        recognizer = new Worker(workerURL);
+        recognizer.addEventListener("message", function ( e ) {
+          deferred.resolve(recognizer);
+        }, {once: true});
+        // As arguments, you can pass non-default path to pocketsphinx.js and pocketsphinx.wasm:
+        // recognizer.postMessage({'pocketsphinx.wasm': '/path/to/pocketsphinx.wasm', 'pocketsphinx.js': '/path/to/pocketsphinx.js'});
+        recognizer.postMessage({});
+        return deferred.promise();
+      };
+
+      // This is just a logging window where we display the status
+      function updateStatus(newStatus) {
+        $('#current-status').append( "<br/>" + newStatus );
+      };
+
+      // A not-so-great recording indicator
+      function displayRecording(display) {
+        if (display) document.getElementById('recording-indicator').innerHTML = "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;";
+        else document.getElementById('recording-indicator').innerHTML = "";
+      };
+
+      // Callback function once the user authorises access to the microphone
+      // in it, we instanciate the recorder
+      function startUserMedia(stream) {
+        var input = audioContext.createMediaStreamSource(stream);
+        // Firefox hack https://support.mozilla.org/en-US/questions/984179
+        window.firefox_audio_hack = input; 
+        recorder = new AudioRecorder(input, {errorCallback: function(x) {updateStatus("Error from recorder: " + x);}});
+        updateStatus("Audio recorder ready");
+        return recorder;
+      };
+
+      var audioLoad = function () {
+        var deferred = $.Deferred();
+        window.AudioContext = window.AudioContext || window.webkitAudioContext;
+        if ( !AudioContext ) {
+          deferred.reject("Error initializing Web Audio browser");
+        } else if ( !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia ) {
+          deferred.reject("No web audio support in this browser");
+        } else {
+          audioContext = new AudioContext();
+          navigator.mediaDevices.getUserMedia({audio: true})
+            .then(deferred.resolve)
+            .catch( function () {
+              deferred.reject("No live audio input in this browser");
+            });
+        }
+        return deferred.promise();
+      };
+
+      // When the page is loaded, we spawn a new recognizer worker and call getUserMedia to
+      // request access to the microphone
+      $(window).on( "load", function () {
+        updateStatus("Initializing web audio and speech recognizer, waiting for approval to access the microphone");
+        callbackManager = new CallbackManager();
+        var workerChain = spawnWorker("js/recognizer.js")
+          .then( function(worker) {
+            // This is the onmessage function, once the worker is fully loaded
+            worker.addEventListener( "message", function (e) {
+              console.log( e.data );
+              // This is the case when we have a callback id to be called
+              if (e.data.hasOwnProperty('id')) {
+                var clb = callbackManager.get(e.data['id']);
+                var data = {};
+                if ( e.data.hasOwnProperty('data')) data = e.data.data;
+                if(clb) clb(data);
+              }
+              // This is a case when the recognizer has a new hypothesis
+              if (e.data.hasOwnProperty('hyp')) {
+                var newHyp = e.data.hyp;
+                if (e.data.hasOwnProperty('final') &&  e.data.final) newHyp = "Final: " + newHyp.replace( /#/g, "" );
+                newHyp = newHyp.replace( /#/g, "<span style='color:#ccc'>#</span>" );
+                $("#output").html(newHyp);
+              }
+              // This is the case when we have an error
+              if (e.data.hasOwnProperty('status') && (e.data.status == "error")) {
+                updateStatus("Error in " + e.data.command + " with code " + e.data.code);
+              }
+            });
+          })/*.then(
+            // Once the worker is fully loaded, we can call the initialize function
+            // but before that we lazy-load two files for keyword spoting (key phrase
+            // file plus associated dictionary.
+            postRecognizerJob({
+              command: 'lazyLoad',
+              data: {folders: [], files: [["/", "kws.txt", "../kws.txt"], ["/", "kws.dict", "../kws.dict"]]}
+            })
+          )*/.then(
+            // You can pass parameters to the recognizer, such as : {command: 'initialize', data: [["-hmm", "my_model"], ["-fwdflat", "no"]]}
+            postRecognizerJob({command: 'initialize', data: [/*["-kws", "kws.txt"], ["-dict","kws.dict"]*/]})
+          ).then( function () {
+            if (recorder) recorder.consumers = [recognizer];
+          }).then(
+            postRecognizerJob({command: 'addWords', data: wordList})
+          ).then( function () {
+            var defArray = [];
+            grammars.forEach(function ( el, i ) {
+              var deferred = $.Deferred();
+              postRecognizerJob({command: 'addGrammar', data: el.g})()
+                .then( function (data) {
+                  grammarIds[i].id = data;
+                  deferred.resolve();
+                });
+              defArray.push( deferred.promise() );
+              grammarIds[i] = {title: grammars[i].title};
+            });
+            grammarIds.push({"id":0, "title": "Keyword spotting"});
+            return $.when.apply(null, defArray);
+          }).then( function () {
+            var selectTag = $('#grammars');
+            for (var i = 0; i < grammarIds.length; i++) {
+                var newElt = $('<option>').val(grammarIds[i].id).text(grammarIds[i].title);
+                selectTag.append(newElt);
+            }
+            updateStatus("Recognizer ready");
+          });
+
+        var audioChain = audioLoad()
+          .fail(updateStatus)
+          .then(startUserMedia);
+          
+        $.when( audioChain, workerChain ).then( function () {
+          // If a recognizer is ready, we pass it to the recorder
+          if (recognizer) recorder.consumers = [recognizer];
+          $("#startBtn,#stopBtn,#hold").prop("disabled", false);
+        });
+
+        // Wiring JavaScript to the UI
+        $("#startBtn,#stopBtn,#hold").prop("disabled", true);
+        $("#startBtn").on("click", function () {
+          var id = document.getElementById('grammars').value;
+          if (recorder && recorder.start(id)) displayRecording(true);
+        });
+        $("#stopBtn").on("click", function () {
+          recorder && recorder.stop();
+          displayRecording(false);
+        });
+        $("#hold").on("mousedown", function () {
+          var id = document.getElementById('grammars').value;
+          if (recorder && recorder.start(id)) displayRecording(true);
+        }).on("mouseup", function () {
+          recorder && recorder.stop();
+          displayRecording(false);
+        });
+      });
+
+       // This is the list of words that need to be added to the recognizer
+       // This follows the CMU dictionary format
+       
+      var books = [
+        ["Genesis", "G EH N EH S IH S"],
+        ["Exodus", "EH K S AH D AH S"],
+        ["Leviticus", "L AH V IH T AH K AH S"],
+        ["Leviticus(1)", "L EH V IY T AH K AH S"],
+        ["Numbers", "N AH M B ER Z"],
+        ["Deuteronomy", "D UW T EH R AE N OW M IY"],
+      ];
+      var booksHe = [
+        ["בראשית", "B EH R EY SH IY T"],
+        ["שמות", "SH EH M OW T"],
+        ["ויקרא", "V AA Y IY K R AA"],
+        ["במדבר", "B EH M IY D B AA R"],
+        ["במדבר(1)", "B AH M IY D B AA R"],
+        ["דברים", "D EH V AA R IY M"]
+      ];
+      var digits = [
+        ["1", "W AH N"], ["2", "T UW"], ["3", "TH R IY"], ["4", "F AO R"], ["5", "F AY V"], ["6", "S IH K S"], ["7", "S EH V AH N"], ["8", "EY T"], ["9", "N AY N"]
+      ];
+      var teens = [
+        ["10", "T EH N"], ["11", "IH L EH V AH N"], ["12", "T W EH L V"], ["13", "TH ER T IY N"], ["14", "F AO R T IY N"], ["15", "F IH F T IY N"], ["16", "S IH K S T IY N"], ["17", "S EH V AH N T IY N"], ["18", "EY T IY N"], ["19", "N AY N T IY N"]
+      ];
+      var numbers = [
+        ["20", "T W EH N T IY"], ["30", "TH ER D IY"], ["40", "F AO R T IY"], ["50", "F IH F T IY"], ["60", "S IH K S T IY"], ["70", "S EH V AH N T IY"], ["80", "EY T IY"], ["90", "N AY N T IY"], ["100", "W AH N   HH AH N D R AH D"]
+      ];
+      
+      var alephToTet = [
+["א", "AA L EH F"],
+["א(1)", "AA L IH F"],
+["ב", "B EH T"],
+["ב(1)", "B EY Z"],
+["ג", "G IH M IH L"],
+["ד", "D AA L EH D"],
+["ד(1)", "D AA L IH D"],
+["ה", "HH EY"],
+["ו", "V AA V"],
+["ו(1)", "V AH V"],
+["ז", "Z AA Y IH N"],
+["ז(1)", "Z AA Y IY N"],
+["ח", "HH EH T"],
+["ח(1)", "HH EH S"],
+["ט", "T EH T"],
+["ט(1)", "T EH S"],
+["י", "Y UH D"],
+["י(1)", "Y UW D"],
+["כ", "K AA F"],
+["כ(1)", "K AH F"],
+["ל", "L AA M EH D"],
+["ל(1)", "L AA M IH D"],
+["מ", "M EH M"],
+["נ", "N UH N"],
+["נ(1)", "N UW N"],
+["ס", "S AA M EH HH"],
+["ס(1)", "S AA M IH HH"],
+["ע", "AA Y IH N"],
+["ע(1)", "AA Y IY N"],
+["פ", "P EY"],
+["צ", "T S AA D EH"],
+["צ(1)", "T S AA D IY"],
+["צ(2)", "T S AA D IY K"],
+["ק", "K UW F"],
+["ר", "R EY SH"],
+["ש", "S IH N"],
+["ש(1)", "SH IH N"],
+["ת", "T AA F"],
+["ת(1)", "T AH F"],
+["ת(2)", "T AA V"],
+["ת(3)", "T AH V"]
+      ];
+      
+      //בראשית | א | ז
+      
+      
+      var garbageFilter = "AA AE AH AO AW AY B CH D DH EH ER EY F G HH IH IY JH K L M N NG OW OY P R S SH T TH UH UW V W Y Z ZH".split(" ").map(function (el, i) { return [( i ? "#(" + i + ")" : "#" ), el]; });
+      var garbageFilter = [
+        ["#", "AA"],
+        ["#(1)", "UH"],
+      ];
+      var morewords = [
+      ["Chapter", "CH AE P T ER"], ["Verse", "V ER S"],
+      ["פרק", "P EH R EH K"], ["פסוק", "P AA S UW K"],
+      ];
+      
+      var wordList = [].concat(numbers).concat(books).concat(booksHe).concat(morewords).concat(digits).concat(teens).concat(garbageFilter).concat(alephToTet);
+      
+      var grammarFreeform = {numStates: 1, start: 0, end: 0, transitions: []};
+      
+      [books, booksHe, garbageFilter].forEach( function ( el1 ) {
+        el1.forEach( function ( el ) {
+          grammarFreeform.transitions.push({from: 0, to: 0, logp: -2, word: el[0]});
+        });
+      });
+      [numbers, morewords, digits, teens, alephToTet].forEach( function ( el1 ) {
+        el1.forEach( function ( el ) {
+          grammarFreeform.transitions.push({from: 0, to: 0, logp: 2, word: el[0]});
+        });
+      });
+      
+      var grammarHebrewLetters = {numStates: 1, start: 0, end: 0, transitions: []};
+      grammarHebrewLetters.transitions.push({from: 0, to: 0, logp: 4, word: "#"});
+      alephToTet.forEach( function ( el, i ) {
+        if ( el[0].match(/\(\d+\)$/) ) return;
+        grammarHebrewLetters.transitions.push({from: 0, to: 0, logp: 2, word: el[0]});
+      });
+      var grammarNumbers = {numStates: 1, start: 0, end: 0, transitions: []};
+      grammarNumbers.transitions.push({from: 0, to: 0, logp: 4, word: "#"});
+      digits.forEach( function ( el, i ) {
+        if ( el[0].match(/\(\d+\)$/) ) return;
+        grammarNumbers.transitions.push({from: 0, to: 0, logp: 2, word: el[0]});
+      });
+
+
+      var grammarHebrew = {numStates: 4, start: 0, end: 3, transitions: []};
+      booksHe.forEach( function ( el, i ) {
+        if ( el[0].match(/\(\d+\)$/) ) return;
+        grammarHebrew.transitions.push({from: 0, to: 1, logp: 2, word: el[0]});
+      });
+      for ( var i = 0; i < grammarHebrew.numStates; i++ ) {
+        grammarHebrew.transitions.push({from: i, to: i, logp: -1, word: "#"});
+      }
+      grammarHebrew.transitions.push({from: 1, to: 1, logp: 2, word: "פרק"});
+      alephToTet.forEach( function ( el, i ) {
+        if ( el[0].match(/\(\d+\)$/) ) return;
+        grammarHebrew.transitions.push({from: 1, to: 2, logp: 2, word: el[0]});
+        grammarHebrew.transitions.push({from: 2, to: 3, logp: 2, word: el[0]});
+      });
+      grammarHebrew.transitions.push({from: 2, to: 2, logp: 2, word: "פסוק"});
+      grammarHebrew.transitions.push({from: 2, to: 3, logp: -1, word: ""});
+      
+      
+      
+      var grammarBooks = {numStates: 8, start: 0, end: 7, transitions: []};
+      grammarBooks.transitions.push({from: 1, to: 2, logp: 2, word: "Chapter"});
+      grammarBooks.transitions.push({from: 4, to: 5, logp: 2, word: "Verse"});
+
+      garbageFilter.forEach( function ( el, i ) {
+        for ( var i = 0; i < grammarBooks.numStates; i++ ) {
+          grammarBooks.transitions.push({from: i, to: i, logp: -1, word: el[0]});
+        }
+      });
+      books.forEach( function ( el, i ) {
+        grammarBooks.transitions.push({from: 0, to: 1, logp: 1.2, word: el[0]});
+      });
+      digits.forEach( function ( el, i ) {
+        grammarBooks.transitions.push({from: 2, to: 4, logp: 2, word: el[0]});
+        grammarBooks.transitions.push({from: 3, to: 4, word: el[0]});
+        grammarBooks.transitions.push({from: 5, to: 7, logp: 2, word: el[0]});
+        grammarBooks.transitions.push({from: 6, to: 7, word: el[0]});
+//        grammarBooks.transitions.push({from: 1, to: 1, word: el[0]});
+//        grammarBooks.transitions.push({from: 2, to: 3, word: el[0]});
+      });
+      teens.forEach( function ( el, i ) {
+        grammarBooks.transitions.push({from: 2, to: 4, word: el[0]});
+        grammarBooks.transitions.push({from: 5, to: 7, word: el[0]});
+      });
+      numbers.forEach( function ( el, i ) {
+        grammarBooks.transitions.push({from: 2, to: 3, word: el[0]});
+        grammarBooks.transitions.push({from: 5, to: 6, word: el[0]});
+//        grammarBooks.transitions.push({from: 1, to: 1, word: el[0]});
+//        grammarBooks.transitions.push({from: 2, to: 3, word: el[0]});
+      });
+      var grammars = [{title: "Numbers", g: grammarNumbers}, {title: "Hebrew Letters", g: grammarHebrewLetters}, {title: "Hebrew", g: grammarHebrew}, {title: "Structured", g: grammarBooks}, {title: "Freeform", g: grammarFreeform}];
+      var grammarIds = [];
+    </script>
+    <!-- These are the two JavaScript files you must load in the HTML,
+    The recognizer is loaded through a Web Worker -->
+    <script src="js/audioRecorder.js"></script>
+    <script src="js/callbackManager.js"></script>
+  </body>
+</html>
